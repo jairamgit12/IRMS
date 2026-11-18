@@ -1,0 +1,269 @@
+import Application from "../models/Application.js";
+import Referral from "../models/Referral.js";
+import User from "../models/User.js";
+import Job from "../models/Job.js";
+import ActivityLog from "../models/ActivityLog.js";
+import AppError from "../utils/AppError.js";
+import asyncHandler from "../utils/asyncHandler.js";
+import { notify } from "../services/notificationService.js";
+import { escapeRegex } from "../utils/helpers.js";
+const populated = (query, includeInternalJobDetails = false) =>
+  query
+    .populate("candidate", "name email phone profilePicture")
+    .populate(
+      "job",
+      includeInternalJobDetails ? undefined : "-clientName -projectName",
+    )
+    .populate("referral");
+
+const contactQuery = (contact) => {
+  const value = contact.trim().toLowerCase();
+  return { $or: [{ email: value }, { phone: contact.trim() }] };
+};
+export const checkDuplicate = asyncHandler(async (req, res) => {
+  const { candidateContact, job } = req.query;
+  if (!candidateContact || !job)
+    return res.json({ candidateExists: false, referralExists: false });
+  const candidate = await User.findOne({
+    role: "candidate",
+    ...contactQuery(candidateContact),
+  })
+    .select("_id")
+    .lean();
+  const referral = await Referral.findOne({
+    candidateContact: candidateContact.trim(),
+  })
+    .select("_id")
+    .lean();
+  const application = candidate
+    ? await Application.findOne({ candidate: candidate._id, job })
+        .select("_id status")
+        .lean()
+    : null;
+  const otherCandidateExists =
+    candidate && String(candidate._id) !== String(req.user.id);
+  res.json({
+    candidateExists: Boolean(otherCandidateExists),
+    referralExists: Boolean(referral || application),
+    applicationStatus: application?.status || null,
+  });
+});
+export const createApplication = asyncHandler(async (req, res) => {
+  if (!req.file) throw new AppError("Resume is required");
+  const { job, referral, coverLetter, additionalNotes } = req.body;
+
+  // Validate job exists and is active
+  const jobDoc = await Job.findById(job).select("status").lean();
+  if (!jobDoc) throw new AppError("Job not found", 404);
+  if (jobDoc.status !== "active") throw new AppError("This job is no longer accepting applications", 400);
+
+  const exists = await Application.findOne({ candidate: req.user.id, job });
+  if (exists) throw new AppError("You have already applied for this job", 409);
+  let referralData;
+  try {
+    referralData = JSON.parse(referral);
+  } catch {
+    throw new AppError("Referral details are invalid");
+  }
+  if (
+    !referralData.candidateContact ||
+    !/^(?:[^\s@]+@[^\s@]+\.[^\s@]+|\+?[\d\s().-]{7,})$/.test(
+      referralData.candidateContact.trim(),
+    )
+  )
+    throw new AppError("Enter a valid candidate phone number or email address");
+  referralData.candidateContact = referralData.candidateContact.trim();
+  const candidate = await User.findOne({
+    role: "candidate",
+    ...contactQuery(referralData.candidateContact),
+  })
+    .select("_id")
+    .lean();
+  if (candidate && String(candidate._id) !== String(req.user.id))
+    throw new AppError("A candidate with this contact already exists", 409);
+  const duplicateReferral = await Referral.findOne({
+    candidateContact: referralData.candidateContact.trim(),
+  })
+    .select("_id")
+    .lean();
+  if (duplicateReferral)
+    throw new AppError("This candidate has already been referred", 409);
+  const ref = await Referral.create(referralData);
+  const application = await Application.create({
+    candidate: req.user.id,
+    job,
+    referral: ref._id,
+    coverLetter,
+    additionalNotes,
+    resume: {
+      path: req.file.filename,
+      originalName: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    },
+    statusHistory: [
+      {
+        status: "Applied",
+        remarks: "Application submitted",
+        changedBy: req.user.id,
+      },
+    ],
+  });
+  const admins = await User.find({ role: "admin", status: "active" });
+  await Promise.all(
+    admins.map((a) =>
+      notify(
+        a._id,
+        "New referral application",
+        `${req.user.name} applied for a job.`,
+      ),
+    ),
+  );
+  await notify(
+    req.user.id,
+    "Application submitted",
+    "Your referral application has been submitted successfully.",
+  );
+  res.status(201).json({
+    application: await populated(Application.findById(application.id)),
+  });
+});
+export const listApplications = asyncHandler(async (req, res) => {
+  const {
+    status,
+    search,
+    department,
+    location,
+    period,
+    group,
+    page = 1,
+    limit = 10,
+  } = req.query;
+  const pageNumber = Math.max(Number(page) || 1, 1);
+  const pageSize = Math.min(Math.max(Number(limit) || 10, 1), 100);
+  const q = req.user.role === "candidate" ? { candidate: req.user.id } : {};
+  if (status) q.status = status;
+  if (period === "today") {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    q.createdAt = { $gte: today };
+  }
+  if (group === "pending")
+    q.status = {
+      $in: ["Applied", "Resume Under Review", "Technical Round", "HR Round"],
+    };
+  const jobQuery = {};
+  if (department) jobQuery.department = department;
+  if (location) jobQuery.location = location;
+  const regex = search ? new RegExp(escapeRegex(search), "i") : null;
+  const [matchingUsers, matchingJobs, matchingReferrals] = await Promise.all([
+    regex
+      ? User.find({ $or: [{ name: regex }, { email: regex }] })
+          .select("_id")
+          .lean()
+      : [],
+    regex || Object.keys(jobQuery).length
+      ? Job.find({ ...jobQuery, ...(regex ? { title: regex } : {}) })
+          .select("_id")
+          .lean()
+      : [],
+    regex ? Referral.find({ employeeId: regex }).select("_id").lean() : [],
+  ]);
+  if (department || location)
+    q.job = { $in: matchingJobs.map((job) => job._id) };
+  if (regex) {
+    q.$or = [
+      { applicationId: regex },
+      { candidate: { $in: matchingUsers.map((user) => user._id) } },
+      { job: { $in: matchingJobs.map((job) => job._id) } },
+      { referral: { $in: matchingReferrals.map((referral) => referral._id) } },
+    ];
+  }
+  const [total, rows] = await Promise.all([
+    Application.countDocuments(q),
+    populated(
+      Application.find(q)
+        .sort("-createdAt")
+        .skip((pageNumber - 1) * pageSize)
+        .limit(pageSize)
+        .lean(),
+      req.user.role === "admin",
+    ),
+  ]);
+  res.json({
+    applications: rows,
+    total,
+    page: pageNumber,
+    pages: Math.ceil(total / pageSize),
+  });
+});
+export const getApplication = asyncHandler(async (req, res) => {
+  const app = await populated(
+    Application.findById(req.params.id),
+    req.user.role === "admin",
+  );
+  if (!app) throw new AppError("Application not found", 404);
+  if (
+    req.user.role === "candidate" &&
+    String(app.candidate?._id) !== String(req.user.id)
+  )
+    throw new AppError("Access denied", 403);
+  res.json({ application: app });
+});
+export const updateStatus = asyncHandler(async (req, res) => {
+  const app = await Application.findById(req.params.id);
+  if (!app) throw new AppError("Application not found", 404);
+  const { status, remarks, internalNotes } = req.body;
+  if (!status) throw new AppError("Status is required");
+  if (
+    ![
+      "Applied",
+      "Resume Under Review",
+      "Interview Scheduled",
+      "Technical Round",
+      "HR Round",
+      "Selected",
+      "Rejected",
+      "Offer Released",
+      "Joined",
+      "Withdrawn",
+    ].includes(status)
+  )
+    throw new AppError("Invalid application status");
+  app.status = status;
+  app.hrRemarks = remarks ?? app.hrRemarks;
+  app.internalNotes = internalNotes ?? app.internalNotes;
+  app.statusHistory.push({ status, remarks, changedBy: req.user.id });
+  await app.save();
+  await notify(
+    app.candidate,
+    "Application status updated",
+    `Your application is now: ${status}`,
+  );
+  await ActivityLog.create({
+    actor: req.user.id,
+    action: `Updated status to ${status}`,
+    entityType: "Application",
+    entityId: app._id,
+  });
+  res.json({
+    application: await populated(Application.findById(app.id), true),
+  });
+});
+export const withdraw = asyncHandler(async (req, res) => {
+  const app = await Application.findOne({
+    _id: req.params.id,
+    candidate: req.user.id,
+  });
+  if (!app) throw new AppError("Application not found", 404);
+  if (["Joined", "Rejected", "Withdrawn"].includes(app.status))
+    throw new AppError("This application cannot be withdrawn");
+  app.status = "Withdrawn";
+  app.statusHistory.push({
+    status: "Withdrawn",
+    remarks: "Withdrawn by candidate",
+    changedBy: req.user.id,
+  });
+  await app.save();
+  res.json({ application: app });
+});
